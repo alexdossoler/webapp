@@ -1,0 +1,20 @@
+# Project Intake Form - Compressed Package
+
+## Available Files:
+- project-intake-form.zip (204KB) - With git history
+- project-intake-form-clean.tar.gz (661KB) - Clean version (recommended)
+
+## Quick Start:
+1. Extract: tar -xzf project-intake-form-clean.tar.gz
+2. Install: npm install  
+3. Run: npm run dev
+
+## Features:
+- 7-step progressive intake form
+- Secure file uploads with image processing
+- TypeScript + Tailwind CSS
+- Local/MinIO storage options
+- n8n webhook integration
+- Mobile responsive design
+
+Ready for production deployment!

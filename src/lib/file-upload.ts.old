@@ -1,0 +1,410 @@
+import sharp from 'sharp';
+import { v4 as uuidv4 } from 'uuid';
+import { fileTypeFromBuffer } from 'file-type';
+import path from 'path';
+import fs from 'fs/promises';
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+
+// Configuration constants
+export const UPLOAD_CONFIG = {
+  // File size limits
+  MAX_FILE_SIZE: 5 * 1024 * 1024, // 5MB per file
+  MAX_TOTAL_SIZE: 30 * 1024 * 1024, // 30MB total per submission
+  MAX_FILES: 6,
+  
+  // Image processing
+  MAX_DIMENSION: 2048, // Max width/height in pixels
+  THUMBNAIL_SIZE: 300,
+  QUALITY: 85, // JPEG quality
+  
+  // Allowed MIME types and extensions
+  ALLOWED_TYPES: [
+    'image/jpeg',
+    'image/jpg', 
+    'image/png',
+    'image/webp'
+  ],
+  
+  ALLOWED_EXTENSIONS: ['jpg', 'jpeg', 'png', 'webp'],
+  
+  // Storage paths
+  UPLOAD_DIR: 'uploads/intake',
+  TEMP_DIR: 'uploads/temp',
+} as const;
+
+// File validation result
+export interface FileValidationResult {
+  isValid: boolean;
+  error?: string;
+  detectedType?: string;
+}
+
+// Processed file result
+export interface ProcessedFile {
+  id: string;
+  originalName: string;
+  filename: string;
+  url: string;
+  thumbnailUrl?: string;
+  size: number;
+  mimeType: string;
+  dimensions?: { width: number; height: number };
+}
+
+// Storage configuration
+export interface StorageConfig {
+  type: 'local' | 'minio';
+  local?: {
+    uploadPath: string;
+    publicPath: string;
+  };
+  minio?: {
+    endpoint: string;
+    accessKey: string;
+    secretKey: string;
+    bucket: string;
+    region?: string;
+  };
+}
+
+/**
+ * Validate file type and content
+ */
+export async function validateFile(buffer: Buffer, originalName: string): Promise<FileValidationResult> {
+  try {
+    // Check file size
+    if (buffer.length > UPLOAD_CONFIG.MAX_FILE_SIZE) {
+      return {
+        isValid: false,
+        error: `File too large. Maximum size is ${Math.round(UPLOAD_CONFIG.MAX_FILE_SIZE / 1024 / 1024)}MB`
+      };
+    }
+
+    // Detect actual file type from buffer
+    const detectedType = await fileTypeFromBuffer(buffer);
+    
+    if (!detectedType) {
+      return {
+        isValid: false,
+        error: 'Unable to determine file type'
+      };
+    }
+
+    // Validate MIME type
+    if (!UPLOAD_CONFIG.ALLOWED_TYPES.includes(detectedType.mime)) {
+      return {
+        isValid: false,
+        error: `File type not supported. Allowed types: ${UPLOAD_CONFIG.ALLOWED_EXTENSIONS.join(', ')}`
+      };
+    }
+
+    // Validate extension matches detected type
+    const fileExtension = path.extname(originalName).toLowerCase().substring(1);
+    const expectedExtensions = {
+      'image/jpeg': ['jpg', 'jpeg'],
+      'image/png': ['png'],
+      'image/webp': ['webp']
+    };
+
+    const allowedExts = expectedExtensions[detectedType.mime as keyof typeof expectedExtensions] || [];
+    if (fileExtension && !allowedExts.includes(fileExtension)) {
+      return {
+        isValid: false,
+        error: 'File extension does not match content type'
+      };
+    }
+
+    return {
+      isValid: true,
+      detectedType: detectedType.mime
+    };
+
+  } catch (error) {
+    console.error('File validation error:', error);
+    return {
+      isValid: false,
+      error: 'File validation failed'
+    };
+  }
+}
+
+/**
+ * Process and resize image with Sharp
+ */
+export async function processImage(buffer: Buffer, mimeType: string): Promise<{
+  processed: Buffer;
+  thumbnail: Buffer;
+  metadata: { width: number; height: number };
+}> {
+  try {
+    // Get image metadata
+    const metadata = await sharp(buffer).metadata();
+    
+    // Determine output format
+    let format: 'jpeg' | 'png' | 'webp' = 'jpeg';
+    if (mimeType === 'image/png') format = 'png';
+    if (mimeType === 'image/webp') format = 'webp';
+
+    // Process main image
+    const processed = await sharp(buffer)
+      .rotate() // Auto-rotate based on EXIF
+      .resize({
+        width: UPLOAD_CONFIG.MAX_DIMENSION,
+        height: UPLOAD_CONFIG.MAX_DIMENSION,
+        fit: 'inside',
+        withoutEnlargement: true
+      })
+      .withMetadata(false) // Strip EXIF data for privacy
+      [format]({ quality: UPLOAD_CONFIG.QUALITY })
+      .toBuffer();
+
+    // Create thumbnail
+    const thumbnail = await sharp(buffer)
+      .rotate()
+      .resize({
+        width: UPLOAD_CONFIG.THUMBNAIL_SIZE,
+        height: UPLOAD_CONFIG.THUMBNAIL_SIZE,
+        fit: 'cover'
+      })
+      .withMetadata(false)
+      .jpeg({ quality: 80 })
+      .toBuffer();
+
+    return {
+      processed,
+      thumbnail,
+      metadata: {
+        width: metadata.width || 0,
+        height: metadata.height || 0
+      }
+    };
+
+  } catch (error) {
+    console.error('Image processing error:', error);
+    throw new Error('Failed to process image');
+  }
+}
+
+/**
+ * File storage service
+ */
+export class FileStorageService {
+  private config: StorageConfig;
+  private s3Client?: S3Client;
+
+  constructor(config: StorageConfig) {
+    this.config = config;
+    
+    if (config.type === 'minio' && config.minio) {
+      this.s3Client = new S3Client({
+        endpoint: config.minio.endpoint,
+        region: config.minio.region || 'us-east-1',
+        credentials: {
+          accessKeyId: config.minio.accessKey,
+          secretAccessKey: config.minio.secretKey,
+        },
+        forcePathStyle: true, // Required for MinIO
+      });
+    }
+  }
+
+  /**
+   * Save file to storage
+   */
+  async saveFile(
+    buffer: Buffer, 
+    filename: string, 
+    mimeType: string,
+    isThumb = false
+  ): Promise<string> {
+    if (this.config.type === 'local') {
+      return this.saveToLocal(buffer, filename, isThumb);
+    } else {
+      return this.saveToMinio(buffer, filename, mimeType, isThumb);
+    }
+  }
+
+  /**
+   * Save to local filesystem
+   */
+  private async saveToLocal(buffer: Buffer, filename: string, isThumb = false): Promise<string> {
+    if (!this.config.local) {
+      throw new Error('Local storage config not provided');
+    }
+
+    const dir = isThumb ? 
+      path.join(this.config.local.uploadPath, 'thumbs') : 
+      this.config.local.uploadPath;
+    
+    // Ensure directory exists
+    await fs.mkdir(dir, { recursive: true });
+    
+    const filePath = path.join(dir, filename);
+    await fs.writeFile(filePath, buffer);
+    
+    // Return public URL
+    const publicPath = isThumb ? 
+      `${this.config.local.publicPath}/thumbs/${filename}` :
+      `${this.config.local.publicPath}/${filename}`;
+    
+    return publicPath;
+  }
+
+  /**
+   * Save to MinIO
+   */
+  private async saveToMinio(
+    buffer: Buffer, 
+    filename: string, 
+    mimeType: string,
+    isThumb = false
+  ): Promise<string> {
+    if (!this.s3Client || !this.config.minio) {
+      throw new Error('MinIO client not configured');
+    }
+
+    const key = isThumb ? `thumbs/${filename}` : `images/${filename}`;
+    
+    await this.s3Client.send(new PutObjectCommand({
+      Bucket: this.config.minio.bucket,
+      Key: key,
+      Body: buffer,
+      ContentType: mimeType,
+      ACL: 'private',
+    }));
+
+    return key; // Return key for later URL generation
+  }
+
+  /**
+   * Generate signed URL for MinIO objects
+   */
+  async getSignedUrl(key: string, expiresIn = 3600): Promise<string> {
+    if (!this.s3Client || !this.config.minio) {
+      throw new Error('MinIO client not configured');
+    }
+
+    const command = new GetObjectCommand({
+      Bucket: this.config.minio.bucket,
+      Key: key,
+    });
+
+    return getSignedUrl(this.s3Client, command, { expiresIn });
+  }
+
+  /**
+   * Delete file from storage
+   */
+  async deleteFile(filename: string): Promise<void> {
+    if (this.config.type === 'local' && this.config.local) {
+      const filePath = path.join(this.config.local.uploadPath, filename);
+      const thumbPath = path.join(this.config.local.uploadPath, 'thumbs', filename);
+      
+      try {
+        await fs.unlink(filePath);
+        await fs.unlink(thumbPath);
+      } catch (error) {
+        console.error('Error deleting local file:', error);
+      }
+    }
+    // TODO: Implement MinIO deletion if needed
+  }
+}
+
+/**
+ * Process multiple files for upload
+ */
+export async function processFileUploads(
+  files: { buffer: Buffer; originalName: string }[],
+  storageService: FileStorageService
+): Promise<{ success: ProcessedFile[]; errors: string[] }> {
+  const success: ProcessedFile[] = [];
+  const errors: string[] = [];
+
+  // Check total file count
+  if (files.length > UPLOAD_CONFIG.MAX_FILES) {
+    errors.push(`Too many files. Maximum ${UPLOAD_CONFIG.MAX_FILES} files allowed.`);
+    return { success, errors };
+  }
+
+  // Check total size
+  const totalSize = files.reduce((sum, file) => sum + file.buffer.length, 0);
+  if (totalSize > UPLOAD_CONFIG.MAX_TOTAL_SIZE) {
+    errors.push(`Total file size too large. Maximum ${Math.round(UPLOAD_CONFIG.MAX_TOTAL_SIZE / 1024 / 1024)}MB allowed.`);
+    return { success, errors };
+  }
+
+  for (const file of files) {
+    try {
+      // Validate file
+      const validation = await validateFile(file.buffer, file.originalName);
+      if (!validation.isValid) {
+        errors.push(`${file.originalName}: ${validation.error}`);
+        continue;
+      }
+
+      // Process image
+      const { processed, thumbnail, metadata } = await processImage(
+        file.buffer, 
+        validation.detectedType!
+      );
+
+      // Generate unique filename
+      const fileId = uuidv4();
+      const extension = validation.detectedType === 'image/png' ? 'png' : 
+                       validation.detectedType === 'image/webp' ? 'webp' : 'jpg';
+      const filename = `${fileId}.${extension}`;
+      const thumbFilename = `${fileId}_thumb.jpg`;
+
+      // Save to storage
+      const url = await storageService.saveFile(processed, filename, validation.detectedType!);
+      const thumbnailUrl = await storageService.saveFile(thumbnail, thumbFilename, 'image/jpeg', true);
+
+      success.push({
+        id: fileId,
+        originalName: file.originalName,
+        filename,
+        url,
+        thumbnailUrl,
+        size: processed.length,
+        mimeType: validation.detectedType!,
+        dimensions: metadata
+      });
+
+    } catch (error) {
+      console.error(`Error processing ${file.originalName}:`, error);
+      errors.push(`${file.originalName}: Processing failed`);
+    }
+  }
+
+  return { success, errors };
+}
+
+/**
+ * Get storage configuration from environment
+ */
+export function getStorageConfig(): StorageConfig {
+  const storageType = process.env.STORAGE_TYPE as 'local' | 'minio' || 'local';
+
+  if (storageType === 'minio') {
+    return {
+      type: 'minio',
+      minio: {
+        endpoint: process.env.MINIO_ENDPOINT || 'http://localhost:9000',
+        accessKey: process.env.MINIO_ACCESS_KEY!,
+        secretKey: process.env.MINIO_SECRET_KEY!,
+        bucket: process.env.MINIO_BUCKET || 'intake-uploads',
+        region: process.env.MINIO_REGION || 'us-east-1',
+      }
+    };
+  }
+
+  return {
+    type: 'local',
+    local: {
+      uploadPath: path.join(process.cwd(), UPLOAD_CONFIG.UPLOAD_DIR),
+      publicPath: '/api/uploads'
+    }
+  };
+}
